@@ -1,4 +1,7 @@
+streamlit
 fastapi
 uvicorn
-streamlit
+groq
+python-dotenv
 requests
+python-multipart
