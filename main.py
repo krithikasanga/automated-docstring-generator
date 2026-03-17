@@ -280,6 +280,107 @@ Required JSON format:
             status_code=500,
             detail=f"Groq API Error: {str(e)}"
         )
+def smart_clean_explanations(explanations, parsed_result):
+
+    code_map = {
+        item["name"]: item.get("function_code", "")
+        for item in parsed_result
+    }
+
+    for item in explanations:
+
+        name = item.get("name", "")
+        code = code_map.get(name, "")
+
+        steps = item.get("step_by_step", [])
+        edge_cases = item.get("edge_cases", [])
+
+        code_lower = code.lower()
+
+        # =========================
+        # 🔥 CLEAN STEP-BY-STEP
+        # =========================
+        cleaned_steps = []
+
+        for step in steps:
+            step_lower = step.lower().strip()
+
+            # ❌ remove fake validations
+            if ("check if" in step_lower or "validate" in step_lower) and "if" not in code_lower:
+                continue
+
+            # ❌ remove incomplete steps
+            if step_lower in ["if", "if not", "else"]:
+                continue
+
+            # ❌ remove hallucinated condition
+            if step_lower.startswith("if") and "if" not in code_lower:
+                continue
+
+            cleaned_steps.append(step)
+
+        item["step_by_step"] = cleaned_steps
+
+        # =========================
+        # 🔥 CLEAN EDGE CASES
+        # =========================
+        cleaned_edges = []
+        seen = set()
+
+        for edge in edge_cases:
+            edge_lower = edge.lower().strip()
+
+            # ❌ remove wrong logic (like "return first element if empty")
+            if "return the first" in edge_lower and "empty" in edge_lower:
+                continue
+
+            # ✅ detect ZeroDivisionError
+            if "/" in code_lower and "len(" in code_lower:
+                if "zero" not in edge_lower:
+                    edge = "May raise ZeroDivisionError if divisor is zero"
+                    edge_lower = edge.lower()
+
+            # ❌ remove duplicate ZeroDivisionError
+            if "zerodivisionerror" in edge_lower:
+                if any("zerodivisionerror" in e.lower() for e in cleaned_edges):
+                    continue
+
+            # ✅ detect IndexError
+            if "[0]" in code_lower:
+                if "empty" not in edge_lower:
+                    edge = "May raise IndexError if input list is empty"
+                    edge_lower = edge.lower()
+
+            # ❌ remove fake type errors
+            if ("type" in edge_lower or "string" in edge_lower or "invalid" in edge_lower):
+                if "isinstance" not in code_lower and "type(" not in code_lower:
+                    continue
+
+            # ❌ remove fake empty string returns
+            if "empty string" in edge_lower or "return empty" in edge_lower:
+                if '""' not in code and "return ''" not in code:
+                    continue
+
+            # ❌ remove vague AI statements
+            if ("incorrectly" in edge_lower or "may cause" in edge_lower):
+                if "raise" not in edge_lower:
+                    continue
+
+            # ❌ remove fake padding logic
+            if "pad" in edge_lower:
+                if "len(" not in code_lower:
+                    continue
+
+            # ❌ remove duplicates
+            if edge_lower in seen:
+                continue
+
+            seen.add(edge_lower)
+            cleaned_edges.append(edge)
+
+        item["edge_cases"] = cleaned_edges
+
+    return explanations
 
 #ai explanation
 def explain_code_with_ai(parsed_structure, code_text, imports):
@@ -316,6 +417,9 @@ For each function return:
 Edge cases must be logically correct and reflect actual behavior of the code.
 Edge cases must be clearly explained.
 Ensure all examples and edge cases are logically correct and mathematically accurate.
+- Only describe behavior that is explicitly present in the code
+- Do NOT assume validations or checks unless clearly implemented
+- Do NOT invent edge cases
 
 IMPORTANT:
 - Ensure all examples are logically correct
@@ -477,7 +581,6 @@ async def explain_code(file: UploadFile = File(...)):
         all_explanations = []
 
         for chunk in chunk_list(parsed_result, 3):
-
             ai_result = explain_code_with_ai(chunk, code_text, imports)
 
             try:
@@ -500,6 +603,7 @@ async def explain_code(file: UploadFile = File(...)):
                     "edge_cases": ["Invalid JSON returned by AI"]
                 }
             ]
+
         else:
             explanations = all_explanations
 
@@ -509,10 +613,13 @@ async def explain_code(file: UploadFile = File(...)):
                 if not isinstance(item, dict):
                     continue
 
-                ai_name = item.get("name", "").strip().lower()
+                ai_name = item.get("name", "")
+                normalized_ai = ai_name.lower().replace("_", "").strip()
 
-                if ai_name in ["init", "__init__", "constructor"]:
+                # ✅ HANDLE __init__
+                if normalized_ai == "init":
                     item["name"] = "__init__"
+
                 else:
                     matched_name = None
 
@@ -520,7 +627,10 @@ async def explain_code(file: UploadFile = File(...)):
                         original_name = parsed.get("name", "")
                         normalized_parsed = original_name.lower().replace("__", "")
 
-                        if ai_name == normalized_parsed or ai_name == original_name.lower():
+                        if (
+                            normalized_ai == normalized_parsed
+                            or normalized_ai == original_name.lower()
+                        ):
                             matched_name = original_name
                             break
 
@@ -534,6 +644,9 @@ async def explain_code(file: UploadFile = File(...)):
                 item.setdefault("step_by_step", [])
                 item.setdefault("example", "")
                 item.setdefault("edge_cases", [])
+
+            # ✅ CLEAN ONLY VALID AI OUTPUT
+            explanations = smart_clean_explanations(explanations, parsed_result)
 
         return {
             "status": "success",
